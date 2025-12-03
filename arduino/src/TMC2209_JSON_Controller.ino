@@ -29,6 +29,37 @@ const float FULL_STEPS_PER_REV = 400.0f;  // 0.9° per step
 const float MICROSTEPS = 64.0f;
 const float MICROSTEPS_PER_REV = FULL_STEPS_PER_REV * MICROSTEPS;
 
+// ---- COREXY KINEMATICS ----
+// Voron 2.4 specs: GT2 belt (2mm pitch), 20-tooth pulleys
+const float PULLEY_TEETH = 20.0f;
+const float BELT_PITCH_MM = 2.0f;
+const float MM_PER_REV = PULLEY_TEETH * BELT_PITCH_MM;  // 40mm per revolution
+
+// Conversion: mm/s velocity → motor RPM
+// RPM = (mm/s * 60) / mm_per_rev = (mm/s * 60) / 40 = mm/s * 1.5
+const float VELOCITY_TO_RPM = 60.0f / MM_PER_REV;  // 1.5
+
+// ---- WORKSPACE LIMITS (Software Endstops) ----
+float x_min = 0.0f;
+float x_max = 350.0f;  // Default for Voron 2.4 350mm
+float y_min = 0.0f;
+float y_max = 350.0f;
+const float ENDSTOP_MARGIN = 5.0f;  // Stop 5mm before limit
+bool limits_calibrated = false;  // Track if user has calibrated limits
+
+// ---- HOME POSITION ----
+float home_x = 150.0f;  // Default home position (center of 300mm workspace)
+float home_y = 325.0f;  // Default home position (center of 650mm workspace)
+bool home_position_set = false;
+
+// ---- POSITION TRACKING ----
+float current_x = 175.0f;  // Start at center (need homing for accuracy)
+float current_y = 175.0f;
+float current_x_vel = 0.0f;  // Current velocity in mm/s
+float current_y_vel = 0.0f;
+unsigned long last_position_update = 0;
+const float STEPS_PER_MM = (FULL_STEPS_PER_REV * MICROSTEPS) / MM_PER_REV;  // 640
+
 // ---- MOTOR STATE ----
 float target_rpm1 = 0.0f;  // Right motor
 float target_rpm2 = 0.0f;  // Left motor
@@ -77,6 +108,49 @@ void computeIntervalsFromRPM() {
 
   digitalWrite(DIR1_PIN, (target_rpm1 >= 0.0f) ? HIGH : LOW);
   digitalWrite(DIR2_PIN, (target_rpm2 >= 0.0f) ? HIGH : LOW);
+}
+
+void updatePosition() {
+  unsigned long now = micros();
+  float dt = (now - last_position_update) / 1000000.0f;  // seconds
+  
+  if (dt > 0.0f && motorsEnabled) {
+    // Update position based on current velocity
+    current_x += current_x_vel * dt;
+    current_y += current_y_vel * dt;
+    
+    // Clamp to workspace limits (if calibrated)
+    if (limits_calibrated) {
+      if (current_x < x_min) current_x = x_min;
+      if (current_x > x_max) current_x = x_max;
+      if (current_y < y_min) current_y = y_min;
+      if (current_y > y_max) current_y = y_max;
+    }
+  }
+  
+  last_position_update = now;
+}
+
+bool checkEndstops(float target_x_vel, float target_y_vel) {
+  // If not calibrated, don't enforce limits
+  if (!limits_calibrated) {
+    return true;
+  }
+  
+  // Check if movement would exceed limits (with margin)
+  if (target_x_vel > 0 && current_x >= (x_max - ENDSTOP_MARGIN)) {
+    return false;  // Would hit +X limit
+  }
+  if (target_x_vel < 0 && current_x <= (x_min + ENDSTOP_MARGIN)) {
+    return false;  // Would hit -X limit
+  }
+  if (target_y_vel > 0 && current_y >= (y_max - ENDSTOP_MARGIN)) {
+    return false;  // Would hit +Y limit
+  }
+  if (target_y_vel < 0 && current_y <= (y_min + ENDSTOP_MARGIN)) {
+    return false;  // Would hit -Y limit
+  }
+  return true;  // Movement is safe
 }
 
 void sendResponse(const char* cmd, const char* status, const char* message) {
@@ -209,7 +283,176 @@ void handleDiagCommand() {
   doc["stepInterval2_us"] = stepInterval2_us;
   doc["driver1_version"] = driver1.version();
   doc["driver2_version"] = driver2.version();
+  doc["x_pos"] = current_x;
+  doc["y_pos"] = current_y;
+  doc["x_vel"] = current_x_vel;
+  doc["y_vel"] = current_y_vel;
+  doc["limits_calibrated"] = limits_calibrated;
   serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void handleHomeCommand(JsonDocument& doc) {
+  // Set position to specified coordinates (manual homing)
+  float x = doc["x"] | 175.0f;  // Default to center
+  float y = doc["y"] | 175.0f;
+  
+  current_x = x;
+  current_y = y;
+  current_x_vel = 0.0f;
+  current_y_vel = 0.0f;
+  
+  JsonDocument resp;
+  resp["cmd"] = "home";
+  resp["status"] = "ok";
+  resp["x_pos"] = current_x;
+  resp["y_pos"] = current_y;
+  serializeJson(resp, Serial);
+  Serial.println();
+}
+
+void handleCalibrateCommand(JsonDocument& doc) {
+  const char* action = doc["action"] | "";
+  
+  if (strcmp(action, "set_min") == 0) {
+    // Set current position as minimum limits
+    x_min = current_x;
+    y_min = current_y;
+    sendResponse("calibrate", "ok", "Minimum limits set");
+  }
+  else if (strcmp(action, "set_max") == 0) {
+    // Set current position as maximum limits
+    x_max = current_x;
+    y_max = current_y;
+    limits_calibrated = true;
+    sendResponse("calibrate", "ok", "Maximum limits set and enabled");
+  }
+  else if (strcmp(action, "reset") == 0) {
+    // Reset to default limits
+    x_min = 0.0f;
+    x_max = 350.0f;
+    y_min = 0.0f;
+    y_max = 650.0f;
+    limits_calibrated = false;
+    home_position_set = false;
+    sendResponse("calibrate", "ok", "Limits reset to defaults");
+  }
+  else if (strcmp(action, "status") == 0) {
+    // Report current limits
+    JsonDocument resp;
+    resp["cmd"] = "calibrate";
+    resp["status"] = "ok";
+    resp["calibrated"] = limits_calibrated;
+    resp["x_min"] = x_min;
+    resp["x_max"] = x_max;
+    resp["y_min"] = y_min;
+    resp["y_max"] = y_max;
+    resp["current_x"] = current_x;
+    resp["current_y"] = current_y;
+    resp["home_x"] = home_x;
+    resp["home_y"] = home_y;
+    resp["home_set"] = home_position_set;
+    serializeJson(resp, Serial);
+    Serial.println();
+  }
+  else if (strcmp(action, "set_home") == 0) {
+    // Set current position as home
+    home_x = current_x;
+    home_y = current_y;
+    home_position_set = true;
+    
+    JsonDocument resp;
+    resp["cmd"] = "calibrate";
+    resp["status"] = "ok";
+    resp["message"] = "Home position set";
+    resp["home_x"] = home_x;
+    resp["home_y"] = home_y;
+    serializeJson(resp, Serial);
+    Serial.println();
+  }
+  else if (strcmp(action, "go_home") == 0) {
+    // Set position to home (teleport - user manually moves gantry)
+    if (!home_position_set) {
+      sendResponse("calibrate", "error", "Home position not set. Use action: set_home first");
+      return;
+    }
+    
+    current_x = home_x;
+    current_y = home_y;
+    current_x_vel = 0.0f;
+    current_y_vel = 0.0f;
+    
+    JsonDocument resp;
+    resp["cmd"] = "calibrate";
+    resp["status"] = "ok";
+    resp["message"] = "Position set to home";
+    resp["x"] = current_x;
+    resp["y"] = current_y;
+    serializeJson(resp, Serial);
+    Serial.println();
+  }
+  else {
+    sendResponse("calibrate", "error", "Unknown action. Use: set_min, set_max, reset, status, set_home, or go_home");
+  }
+}
+
+void handleVelocityCommand(JsonDocument& doc) {
+  if (!motorsEnabled) {
+    sendResponse("velocity", "error", "Motors not enabled");
+    return;
+  }
+
+  // Get X and Y velocities in mm/s
+  float x_vel = doc["x_vel"] | 0.0f;
+  float y_vel = doc["y_vel"] | 0.0f;
+
+  // Check software endstops
+  if (!checkEndstops(x_vel, y_vel)) {
+    // Stop motors - we're at a limit
+    target_rpm1 = 0.0f;
+    target_rpm2 = 0.0f;
+    current_x_vel = 0.0f;
+    current_y_vel = 0.0f;
+    computeIntervalsFromRPM();
+    
+    JsonDocument resp;
+    resp["cmd"] = "velocity";
+    resp["status"] = "endstop";
+    resp["message"] = "Software endstop triggered";
+    resp["x_pos"] = current_x;
+    resp["y_pos"] = current_y;
+    serializeJson(resp, Serial);
+    Serial.println();
+    return;
+  }
+
+  // Store current velocities for position tracking
+  current_x_vel = x_vel;
+  current_y_vel = y_vel;
+
+  // CoreXY kinematics:
+  // Motor1 (Right) controls X + Y
+  // Motor2 (Left)  controls X - Y
+  // For movement in mm/s, convert to RPM
+  float motor1_rpm = (x_vel + y_vel) * VELOCITY_TO_RPM;
+  float motor2_rpm = (x_vel - y_vel) * VELOCITY_TO_RPM;
+
+  // Set motor speeds using existing logic
+  target_rpm1 = motor1_rpm;
+  target_rpm2 = motor2_rpm;
+  computeIntervalsFromRPM();
+
+  // Send response with computed values
+  JsonDocument resp;
+  resp["cmd"] = "velocity";
+  resp["status"] = "ok";
+  resp["x_vel"] = x_vel;
+  resp["y_vel"] = y_vel;
+  resp["motor1_rpm"] = motor1_rpm;
+  resp["motor2_rpm"] = motor2_rpm;
+  resp["x_pos"] = current_x;
+  resp["y_pos"] = current_y;
+  serializeJson(resp, Serial);
   Serial.println();
 }
 
@@ -235,6 +478,15 @@ void processCommand(String jsonCommand) {
   }
   else if (strcmp(cmd, "enable") == 0) {
     handleEnableCommand(doc);
+  }
+  else if (strcmp(cmd, "home") == 0) {
+    handleHomeCommand(doc);
+  }
+  else if (strcmp(cmd, "calibrate") == 0) {
+    handleCalibrateCommand(doc);
+  }
+  else if (strcmp(cmd, "velocity") == 0) {
+    handleVelocityCommand(doc);
   }
   else if (strcmp(cmd, "move") == 0) {
     handleMoveCommand(doc);
@@ -325,6 +577,7 @@ void setup() {
   driver2.irun(31);               // Full running current
 
   computeIntervalsFromRPM();
+  last_position_update = micros();  // Initialize position tracking
   
   Serial.println("{\"type\":\"info\",\"message\":\"TMC2209 JSON Controller Ready\"}");
   sendResponse("status", "ready", "Controller initialized");
@@ -333,6 +586,9 @@ void setup() {
 void loop() {
   // Process serial commands
   processSerialCommands();
+  
+  // Update position tracking
+  updatePosition();
   
   unsigned long now = micros();
 
