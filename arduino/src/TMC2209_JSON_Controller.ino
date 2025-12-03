@@ -4,9 +4,11 @@
 // ---- USER CONFIG ----
 #define R_SENSE 0.11f
 
-// XIAO ESP32-S3 UART pins for TMC2209 bus
-#define TMC_UART_RX D10  // Right motor RX (unused in your pinout but kept for TMC)
-#define TMC_UART_TX D9   // Right motor TX (unused in your pinout but kept for TMC)
+// XIAO ESP32-S3 UART pins - each driver has its own UART bus
+#define TMC1_UART_RX D3  // Driver 1 UART RX
+#define TMC1_UART_TX D4  // Driver 1 UART TX
+#define TMC2_UART_RX D9  // Driver 2 UART RX
+#define TMC2_UART_TX D10 // Driver 2 UART TX
 
 // Right Motor pins
 #define STEP1_PIN D5     // Right STEP
@@ -18,9 +20,9 @@
 #define DIR2_PIN D0      // Left DIR
 #define EN2_PIN D6       // Left ENABLE
 
-// TMC2209 slave addresses
+// TMC2209 slave addresses (not needed with separate UART buses, but keeping for compatibility)
 #define DRIVER1_ADDR 0b00
-#define DRIVER2_ADDR 0b01
+#define DRIVER2_ADDR 0b00  // Both use 0b00 since they're on separate buses
 
 // ---- MOTOR CONSTANTS ----
 const float FULL_STEPS_PER_REV = 400.0f;  // 0.9° per step
@@ -49,9 +51,10 @@ unsigned long lastPulseStart2 = 0;
 bool pulseHigh2 = false;
 
 // ---- TMC objects ----
-HardwareSerial TMCSerial(1);
-TMC2209Stepper driver1(&TMCSerial, R_SENSE, DRIVER1_ADDR);
-TMC2209Stepper driver2(&TMCSerial, R_SENSE, DRIVER2_ADDR);
+HardwareSerial TMCSerial1(1);  // UART bus for driver 1
+HardwareSerial TMCSerial2(2);  // UART bus for driver 2
+TMC2209Stepper driver1(&TMCSerial1, R_SENSE, DRIVER1_ADDR);
+TMC2209Stepper driver2(&TMCSerial2, R_SENSE, DRIVER2_ADDR);
 
 // Command buffer
 String commandBuffer = "";
@@ -196,6 +199,20 @@ void handleSetCurrentCommand(JsonDocument& doc) {
   }
 }
 
+void handleDiagCommand() {
+  JsonDocument doc;
+  doc["cmd"] = "diag";
+  doc["status"] = "ok";
+  doc["motor1_enabled"] = (digitalRead(EN1_PIN) == LOW);
+  doc["motor2_enabled"] = (digitalRead(EN2_PIN) == LOW);
+  doc["stepInterval1_us"] = stepInterval1_us;
+  doc["stepInterval2_us"] = stepInterval2_us;
+  doc["driver1_version"] = driver1.version();
+  doc["driver2_version"] = driver2.version();
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
 void processCommand(String jsonCommand) {
   JsonDocument doc;
   DeserializationError error = deserializeJson(doc, jsonCommand);
@@ -230,6 +247,9 @@ void processCommand(String jsonCommand) {
   }
   else if (strcmp(cmd, "setcurrent") == 0) {
     handleSetCurrentCommand(doc);
+  }
+  else if (strcmp(cmd, "diag") == 0) {
+    handleDiagCommand();
   }
   else {
     sendResponse("error", "failed", "Unknown command");
@@ -276,28 +296,33 @@ void setup() {
   digitalWrite(STEP1_PIN, LOW);
   digitalWrite(STEP2_PIN, LOW);
 
-  // TMC2209 UART
-  TMCSerial.begin(115200, SERIAL_8N1, TMC_UART_RX, TMC_UART_TX);
+  // TMC2209 UART - separate buses for each driver
+  TMCSerial1.begin(115200, SERIAL_8N1, TMC1_UART_RX, TMC1_UART_TX);
+  TMCSerial2.begin(115200, SERIAL_8N1, TMC2_UART_RX, TMC2_UART_TX);
 
   // Driver 1 config
   driver1.begin();
-  driver1.toff(5);
+  driver1.toff(4);                // Off time: 4 for SpreadCycle
   driver1.blank_time(24);
-  driver1.rms_current(800);
+  driver1.rms_current(1000);      // Set to 1A (safe for most NEMA17)
   driver1.microsteps((uint16_t)MICROSTEPS);
-  driver1.en_spreadCycle(false);
+  driver1.en_spreadCycle(true);   // SpreadCycle mode - eliminates whine
   driver1.pdn_disable(true);
   driver1.I_scale_analog(false);
+  driver1.ihold(8);               // Reduced standstill current
+  driver1.irun(31);               // Full running current
 
   // Driver 2 config
   driver2.begin();
-  driver2.toff(5);
+  driver2.toff(4);                // Off time: 4 for SpreadCycle
   driver2.blank_time(24);
-  driver2.rms_current(800);
+  driver2.rms_current(1000);      // Set to 1A (safe for most NEMA17)
   driver2.microsteps((uint16_t)MICROSTEPS);
-  driver2.en_spreadCycle(false);
+  driver2.en_spreadCycle(true);   // SpreadCycle mode - eliminates whine
   driver2.pdn_disable(true);
   driver2.I_scale_analog(false);
+  driver2.ihold(8);               // Reduced standstill current
+  driver2.irun(31);               // Full running current
 
   computeIntervalsFromRPM();
   
