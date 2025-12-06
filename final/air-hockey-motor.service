@@ -1,0 +1,23 @@
+[Unit]
+Description=Air Hockey Motor Controller Daemon
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=aneangel
+WorkingDirectory=/home/aneangel/MECH338/final
+ExecStart=/usr/bin/python3 /home/aneangel/MECH338/final/motor_controller_daemon.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Give the service time to start up
+TimeoutStartSec=30
+
+# Environment variables (if needed)
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target

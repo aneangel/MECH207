@@ -12,18 +12,42 @@ import serial
 import json
 import time
 from typing import Optional, Dict, Any
+import serial.tools.list_ports
+
+def find_xiao_port():
+    """Automatically find XIAO ESP32-S3 port."""
+    ports = serial.tools.list_ports.comports()
+    
+    for port in ports:
+        # Match Espressif vendor ID and product ID
+        if port.vid == 0x303A and port.pid == 0x1001:
+            print(f"Found XIAO ESP32-S3 on {port.device}")
+            return port.device
+    
+    print("XIAO ESP32-S3 not found")
+    return None
 
 class MotorController:
-    def __init__(self, port: str = '/dev/ttyACM0', baudrate: int = 115200, timeout: float = 1.0):
+    def __init__(self, port: str = None, baudrate: int = 115200, timeout: float = 1.0):
         """
         Initialize motor controller communication.
         
         Args:
-            port: Serial port (e.g., '/dev/ttyACM0', '/dev/ttyUSB0')
+            port: Serial port (auto-detected if None)
             baudrate: Communication speed (default: 115200)
             timeout: Serial read timeout in seconds
         """
-        self.port = port
+        # Use auto-detection if no port specified
+        if port is None:
+            detected_port = find_xiao_port()
+            if detected_port:
+                self.port = detected_port
+            else:
+                print("Warning: Could not auto-detect XIAO ESP32-S3, defaulting to /dev/ttyACM1")
+                self.port = '/dev/ttyACM1'
+        else:
+            self.port = port
+            
         self.baudrate = baudrate
         self.timeout = timeout
         self.serial = None

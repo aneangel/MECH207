@@ -24,6 +24,7 @@ import serial
 import json
 import time
 import sys
+import threading
 import serial.tools.list_ports
 
 
@@ -36,10 +37,20 @@ def find_motor_controller():
     return None
 
 
+def find_ir_sensor_board():
+    """Find XIAO RP2350 (IR sensor board)."""
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        # XIAO RP2350 USB VID/PID
+        if port.vid == 0x2886 and port.pid == 0x58:
+            return port.device
+    return None
+
+
 class SimpleMotorController:
     """Simple motor controller for testing."""
     
-    def __init__(self, port=None):
+    def __init__(self, port=None, ir_sensor_port=None, enable_ir_monitor=True):
         if port is None:
             port = find_motor_controller()
             if port is None:
@@ -49,11 +60,23 @@ class SimpleMotorController:
         self.port = port
         self.ser = None
         self.default_speed = 30.0  # Default RPM
+        
+        # IR sensor board
+        self.ir_sensor_port = ir_sensor_port
+        self.ir_sensor_ser = None
+        self.ir_monitor_thread = None
+        self.ir_monitor_running = False
+        self.enable_ir_monitor = enable_ir_monitor
+        
+        # Idle oscillation
+        self.idle_oscillation_thread = None
+        self.idle_oscillation_running = False
+        self.saved_position = (0, 0)  # Store position before oscillation
     
     def connect(self):
         """Connect to motor controller."""
         try:
-            print(f"Connecting to {self.port}...")
+            print(f"Connecting to motor controller at {self.port}...")
             self.ser = serial.Serial(self.port, 115200, timeout=1)
             time.sleep(2)  # Wait for ESP32 to boot
             
@@ -67,10 +90,33 @@ class SimpleMotorController:
             response = self.send_cmd({"cmd": "ping"})
             if response and response.get('status') == 'ok':
                 print(f"✓ Connected to motor controller")
-                return True
             else:
                 print("✗ Ping failed")
                 return False
+            
+            # Connect to IR sensor board if enabled
+            if self.enable_ir_monitor:
+                if self.ir_sensor_port is None:
+                    self.ir_sensor_port = find_ir_sensor_board()
+                
+                if self.ir_sensor_port:
+                    print(f"Connecting to IR sensor board at {self.ir_sensor_port}...")
+                    try:
+                        self.ir_sensor_ser = serial.Serial(self.ir_sensor_port, 115200, timeout=0.1)
+                        time.sleep(1)
+                        print(f"✓ Connected to IR sensor board")
+                        
+                        # Start monitoring thread
+                        self.ir_monitor_running = True
+                        self.ir_monitor_thread = threading.Thread(target=self._monitor_ir_sensors, daemon=True)
+                        self.ir_monitor_thread.start()
+                        print(f"✓ IR sensor monitoring started")
+                    except Exception as e:
+                        print(f"⚠ Warning: Could not connect to IR sensor board: {e}")
+                else:
+                    print(f"⚠ Warning: IR sensor board not found")
+            
+            return True
                 
         except Exception as e:
             print(f"✗ Connection error: {e}")
@@ -108,6 +154,136 @@ class SimpleMotorController:
                 return True
             time.sleep(0.01)
         return False
+    
+    def _monitor_ir_sensors(self):
+        """Monitor IR sensor board for STOP and RESET commands."""
+        print("[IR Monitor] Thread started")
+        while self.ir_monitor_running:
+            try:
+                if self.ir_sensor_ser and self.ir_sensor_ser.in_waiting:
+                    line = self.ir_sensor_ser.readline().decode('utf-8', errors='ignore').strip()
+                    
+                    if not line:
+                        continue
+                    
+                    # Check for goal detection commands
+                    if line == "STOP":
+                        print("\n🎯 [GOAL DETECTED] Stopping gantry...")
+                        self.stop_idle_oscillation()
+                        self.stop()
+                    elif line == "RESET":
+                        print("🔄 [GOAL DETECTED] Resetting to saved position...")
+                        # Send position reset to saved position
+                        self.send_cmd({"cmd": "home", "x": self.saved_position[0], "y": self.saved_position[1]})
+                    elif "GOAL" in line:
+                        print(f"\n🎯 {line}")
+                    elif "Coin detected! Triggering solenoid" in line:
+                        print(f"\n🪙 {line}")
+                        print("🎮 [GAME START] Starting circle motion...")
+                        self.start_idle_oscillation()
+                    elif "IR beam broken" in line:
+                        print(f"\n🪙 {line}")
+                    
+                time.sleep(0.01)  # Small delay to prevent CPU spinning
+                
+            except Exception as e:
+                if self.ir_monitor_running:  # Only print if we're supposed to be running
+                    print(f"[IR Monitor] Error: {e}")
+                break
+        
+        print("[IR Monitor] Thread stopped")
+    
+    def start_idle_oscillation(self, amplitude=20.0, speed=30.0):
+        """Start idle circular motion.
+        
+        Args:
+            amplitude: Radius of circle in mm
+            speed: Movement speed in mm/s
+        """
+        if self.idle_oscillation_running:
+            return  # Already running
+        
+        # Save current position
+        status = self.send_cmd({"cmd": "status"})
+        if status:
+            self.saved_position = (status.get('x', 0), status.get('y', 0))
+        
+        self.idle_oscillation_running = True
+        self.idle_oscillation_thread = threading.Thread(
+            target=self._circle_loop, 
+            args=(amplitude, speed),
+            daemon=True
+        )
+        self.idle_oscillation_thread.start()
+        print(f"[Circle Motion] Started (radius={amplitude}mm at {speed}mm/s)")
+    
+    def stop_idle_oscillation(self):
+        """Stop idle circular motion."""
+        if not self.idle_oscillation_running:
+            return
+        
+        self.idle_oscillation_running = False
+        if self.idle_oscillation_thread and self.idle_oscillation_thread.is_alive():
+            self.idle_oscillation_thread.join(timeout=1)
+        print("[Circle Motion] Stopped")
+    
+    def _circle_loop(self, radius, speed):
+        """Internal circle motion loop that runs in separate thread.
+        
+        Moves in a continuous circle pattern.
+        """
+        import math
+        
+        # Circle parameters
+        num_points = 20  # Number of points in circle
+        angle_step = (2 * math.pi) / num_points
+        
+        angle = 0
+        
+        while self.idle_oscillation_running:
+            try:
+                # Calculate circle point
+                x_offset = radius * math.cos(angle)
+                y_offset = radius * math.sin(angle)
+                
+                # Convert to velocity (move toward next point)
+                next_angle = angle + angle_step
+                next_x = radius * math.cos(next_angle)
+                next_y = radius * math.sin(next_angle)
+                
+                # Velocity is direction to next point
+                dx = next_x - x_offset
+                dy = next_y - y_offset
+                
+                # Normalize and scale by speed
+                magnitude = math.sqrt(dx*dx + dy*dy)
+                if magnitude > 0:
+                    x_vel = (dx / magnitude) * speed
+                    y_vel = (dy / magnitude) * speed
+                else:
+                    x_vel = 0
+                    y_vel = 0
+                
+                # Send velocity command
+                self.send_cmd({"cmd": "velocity", "x_vel": x_vel, "y_vel": y_vel})
+                
+                # Time to reach next point
+                if magnitude > 0:
+                    move_time = magnitude / speed
+                    time.sleep(move_time)
+                
+                # Move to next angle
+                angle = next_angle
+                if angle >= 2 * math.pi:
+                    angle = 0  # Complete circle, start over
+                
+            except Exception as e:
+                print(f"[Circle Motion] Error: {e}")
+                break
+        
+        # Stop motors when exiting
+        self.stop()
+        print("[Circle Motion] Thread stopped")
     
     def enable(self):
         """Enable motors."""
@@ -357,11 +533,24 @@ class SimpleMotorController:
     
     def close(self):
         """Close connection."""
+        # Stop idle oscillation
+        self.stop_idle_oscillation()
+        
+        # Stop IR monitoring
+        if self.ir_monitor_thread:
+            self.ir_monitor_running = False
+            if self.ir_monitor_thread.is_alive():
+                self.ir_monitor_thread.join(timeout=1)
+        
+        if self.ir_sensor_ser and self.ir_sensor_ser.is_open:
+            self.ir_sensor_ser.close()
+            print("IR sensor board disconnected")
+        
         if self.ser and self.ser.is_open:
             self.stop()
             self.disable()
             self.ser.close()
-            print("Disconnected")
+            print("Motor controller disconnected")
 
 
 
